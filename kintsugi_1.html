@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>金継ぎ — Kintsugi</title>
+<style>
+  :root{
+    --washi:   #EFE9DC;
+    --sumi:    #1C1A17;
+    --sumi-soft:#4A453E;
+    --shu:     #B43B2E;
+    --gold:    #C9A227;
+    --serif: "Hiragino Mincho ProN","Yu Mincho","Noto Serif JP",serif;
+    --mono: "SF Mono",Menlo,Consolas,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden}
+  body{
+    background:var(--washi);
+    font-family:var(--serif);color:var(--sumi);
+    -webkit-user-select:none;user-select:none;touch-action:none;
+  }
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+
+  #title{position:fixed;top:28px;left:26px;z-index:5;writing-mode:vertical-rl;pointer-events:none}
+  #title h1{font-size:clamp(22px,3.2vmin,34px);font-weight:500;letter-spacing:.55em}
+  #title .en{margin-top:6px;margin-right:2px;font-family:var(--mono);font-size:9px;letter-spacing:.3em;color:var(--sumi-soft);writing-mode:vertical-rl}
+
+  #hint{
+    position:fixed;left:50%;top:18%;transform:translateX(-50%);
+    z-index:5;pointer-events:none;
+    font-size:clamp(13px,2vmin,17px);letter-spacing:.8em;text-indent:.8em;
+    color:var(--sumi-soft);opacity:1;transition:opacity 1s ease;text-align:center;
+  }
+  #hint.gone{opacity:0}
+
+  #kotoba{
+    position:fixed;right:30px;bottom:90px;z-index:5;pointer-events:none;
+    writing-mode:vertical-rl;
+    font-size:clamp(13px,1.9vmin,17px);letter-spacing:.45em;line-height:2.2;
+    color:var(--sumi-soft);
+    opacity:0;transition:opacity 2s ease;
+  }
+  #kotoba.show{opacity:1}
+  #kotoba .g{color:#A8861F}
+
+  #ui{
+    position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
+    z-index:5;display:flex;align-items:center;gap:clamp(14px,2.6vw,30px);
+    padding:10px 22px;background:rgba(239,233,220,.72);backdrop-filter:blur(6px);
+    border:1px solid rgba(28,26,23,.12);border-radius:99px;
+  }
+  .btn{
+    font-family:var(--serif);font-size:clamp(12px,1.6vmin,14px);
+    letter-spacing:.25em;text-indent:.25em;color:var(--sumi);
+    background:none;border:none;cursor:pointer;padding:6px 4px;
+    border-bottom:1px solid transparent;
+    transition:border-color .25s,color .25s,opacity .25s;
+  }
+  .btn:hover{border-bottom-color:var(--sumi)}
+  .btn.active{border-bottom-color:var(--shu);color:var(--shu)}
+  .btn:disabled{opacity:.3;cursor:default;border-bottom-color:transparent !important}
+  .btn:focus-visible{outline:1.5px solid var(--shu);outline-offset:3px;border-radius:4px}
+  #mend{color:#A8861F}
+  #mend:hover{border-bottom-color:#A8861F}
+  .sep{width:1px;height:18px;background:rgba(28,26,23,.18)}
+
+  @media (max-width:640px){
+    #title{top:18px;left:14px}
+    #ui{gap:10px;padding:8px 14px;bottom:14px;max-width:94vw;flex-wrap:wrap;justify-content:center;border-radius:24px}
+    #kotoba{right:16px;bottom:120px}
+  }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="title">
+  <h1>金継ぎ</h1>
+  <div class="en">KINTSUGI — FRACTURE &amp; REPAIR</div>
+</div>
+
+<div id="hint">器 を 、打 つ</div>
+
+<div id="kotoba">傷は、隠さない。<br><span class="g">金で、景色にする。</span></div>
+
+<div id="ui">
+  <button class="btn glz active" data-g="hakuji">白磁</button>
+  <button class="btn glz" data-g="seiji">青磁</button>
+  <button class="btn glz" data-g="gosu">呉須</button>
+  <div class="sep"></div>
+  <button class="btn" id="mend" disabled>継ぐ</button>
+  <div class="sep"></div>
+  <button class="btn" id="renew">新しい器</button>
+</div>
+
+<script>
+'use strict';
+/* ============================================================
+   金継ぎ
+   ・破砕: 打点に密なVoronoi分割で器を割る
+   ・物理: 破片を剛体として落下・回転・床でのバウンド
+   ・修復: 破片が元の位置へ還り、割れ目に金が流れる
+============================================================ */
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const DPR = Math.min(devicePixelRatio||1, 2);
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+let W=0, H=0;
+let CX=0, CY=0, R=0;          // 器の中心と半径
+let FLOOR=0;
+let tex, texCtx;               // 器のテクスチャ(金も焼き込む)
+let goldCan, goldCtx;          // 今回の継ぎ目(完成後texへ焼き込み)
+let glaze = 'hakuji';
+let state = 'intact';          // intact | shattered | mending | gilding
+let shards = [];               // 破片(剛体)
+let seams = [];                // 割れ目の線分 [{x0,y0,x1,y1, p:0}]
+let mendT = 0;
+let breaks = 0;                // 何度継いだか
+
+/* ---------- 初期化 ---------- */
+function resize(){
+  W = innerWidth; H = innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  CX = W/2; CY = H*0.44;
+  R = Math.min(W,H)*0.26;
+  FLOOR = H*0.80;
+  makePlate();
+  state = 'intact'; shards=[]; seams=[]; breaks=0;
+  setMendEnabled(false);
+  document.getElementById('kotoba').classList.remove('show');
+}
+
+/* ---------- 器のテクスチャ ---------- */
+function makePlate(){
+  const S = Math.ceil(R*2*DPR);
+  tex = document.createElement('canvas');
+  tex.width = S; tex.height = S;
+  texCtx = tex.getContext('2d');
+  const t = texCtx, r = S/2;
+  t.clearRect(0,0,S,S);
+  t.save();
+  t.beginPath(); t.arc(r,r,r-1,0,Math.PI*2); t.clip();
+
+  if (glaze === 'hakuji'){
+    const g = t.createRadialGradient(r*0.8,r*0.8,r*0.1, r,r,r);
+    g.addColorStop(0,'#FBF8F1'); g.addColorStop(0.75,'#F2EDE2'); g.addColorStop(1,'#E2DACA');
+    t.fillStyle = g; t.fillRect(0,0,S,S);
+    ring(t,r,r*0.62,'rgba(120,110,95,0.18)',r*0.012);
+  } else if (glaze === 'seiji'){
+    const g = t.createRadialGradient(r*0.78,r*0.74,r*0.1, r,r,r);
+    g.addColorStop(0,'#D9E6DB'); g.addColorStop(0.7,'#B9D2C2'); g.addColorStop(1,'#93B5A0');
+    t.fillStyle = g; t.fillRect(0,0,S,S);
+    /* 貫入(細かいヒビ模様) */
+    t.strokeStyle = 'rgba(90,120,100,0.10)'; t.lineWidth = 0.8;
+    for (let i=0;i<60;i++){
+      let x = Math.random()*S, y = Math.random()*S;
+      t.beginPath(); t.moveTo(x,y);
+      for (let k=0;k<3;k++){ x+=(Math.random()-.5)*S*0.12; y+=(Math.random()-.5)*S*0.12; t.lineTo(x,y); }
+      t.stroke();
+    }
+    ring(t,r,r*0.6,'rgba(70,100,85,0.22)',r*0.012);
+  } else {
+    /* 呉須: 白地にコバルトの筆 */
+    const g = t.createRadialGradient(r*0.8,r*0.8,r*0.1, r,r,r);
+    g.addColorStop(0,'#FAF7F0'); g.addColorStop(1,'#E8E1D2');
+    t.fillStyle = g; t.fillRect(0,0,S,S);
+    ring(t,r,r*0.86,'rgba(36,62,110,0.85)',r*0.035);
+    ring(t,r,r*0.78,'rgba(36,62,110,0.5)', r*0.014);
+    ring(t,r,r*0.34,'rgba(36,62,110,0.7)', r*0.02);
+    /* 筆の点打ち */
+    for (let i=0;i<26;i++){
+      const a = i/26*Math.PI*2 + 0.2;
+      const rr = r*0.58 + Math.sin(i*2.7)*r*0.04;
+      t.fillStyle = `rgba(36,62,110,${0.45+Math.random()*0.3})`;
+      t.beginPath();
+      t.ellipse(r+Math.cos(a)*rr, r+Math.sin(a)*rr, r*0.022, r*0.012, a, 0, Math.PI*2);
+      t.fill();
+    }
+  }
+  /* 釉薬の照り */
+  const hl = t.createRadialGradient(r*0.62,r*0.55,0, r*0.62,r*0.55,r*0.9);
+  hl.addColorStop(0,'rgba(255,255,255,0.30)');
+  hl.addColorStop(0.5,'rgba(255,255,255,0.04)');
+  hl.addColorStop(1,'rgba(255,255,255,0)');
+  t.fillStyle = hl; t.fillRect(0,0,S,S);
+  t.restore();
+  /* 縁 */
+  t.strokeStyle = 'rgba(70,60,50,0.28)';
+  t.lineWidth = Math.max(1.2, r*0.012);
+  t.beginPath(); t.arc(r,r,r-1.2,0,Math.PI*2); t.stroke();
+
+  goldCan = document.createElement('canvas');
+  goldCan.width = S; goldCan.height = S;
+  goldCtx = goldCan.getContext('2d');
+}
+function ring(t,r,rad,col,w){
+  t.strokeStyle = col; t.lineWidth = w;
+  t.beginPath(); t.arc(r,r,rad,0,Math.PI*2); t.stroke();
+}
+
+/* ---------- Voronoi 破砕 ---------- */
+function shatter(ix, iy){
+  /* 種: 打点の周りに密 + 全体に疎 */
+  const N = 19 + Math.floor(Math.random()*5);
+  const seeds = [];
+  for (let i=0;i<N;i++){
+    let x,y;
+    if (i < N*0.55){
+      const a = Math.random()*Math.PI*2;
+      const d = Math.abs(gauss())*R*0.30;
+      x = ix + Math.cos(a)*d; y = iy + Math.sin(a)*d;
+    } else {
+      const a = Math.random()*Math.PI*2, d = Math.sqrt(Math.random())*R*0.92;
+      x = CX + Math.cos(a)*d; y = CY + Math.sin(a)*d;
+    }
+    const dd = Math.hypot(x-CX,y-CY);
+    if (dd > R*0.96){ x = CX+(x-CX)*R*0.9/dd; y = CY+(y-CY)*R*0.9/dd; }
+    seeds.push({x,y});
+  }
+  /* 器の輪郭(多角形近似) */
+  const rim = [];
+  const M = 56;
+  for (let i=0;i<M;i++){
+    const a = i/M*Math.PI*2;
+    rim.push({x:CX+Math.cos(a)*R, y:CY+Math.sin(a)*R, src:-1});
+  }
+  shards = []; seams = [];
+  const seamSet = new Set();
+
+  for (let i=0;i<N;i++){
+    let poly = rim.map(p=>({...p}));
+    for (let j=0;j<N;j++){
+      if (i===j) continue;
+      poly = clipHalfPlane(poly, seeds[i], seeds[j], j);
+      if (poly.length < 3) break;
+    }
+    if (poly.length < 3) continue;
+    /* 継ぎ目: 辺の中点が2つの種からほぼ等距離なら破片同士の境界線 */
+    for (let k=0;k<poly.length;k++){
+      const a = poly[k], b = poly[(k+1)%poly.length];
+      if (Math.hypot(b.x-a.x, b.y-a.y) < 0.6) continue;
+      const mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
+      const di = Math.hypot(mx-seeds[i].x, my-seeds[i].y);
+      let best = -1, bd = 1e18;
+      for (let j=0;j<N;j++){
+        if (j===i) continue;
+        const dj = Math.hypot(mx-seeds[j].x, my-seeds[j].y);
+        if (dj < bd){ bd = dj; best = j; }
+      }
+      if (best >= 0 && Math.abs(bd - di) < 0.8 && i < best){
+        const key = [a.x.toFixed(1),a.y.toFixed(1),b.x.toFixed(1),b.y.toFixed(1)].sort().join(',');
+        if (!seamSet.has(key)){
+          seamSet.add(key);
+          seams.push({x0:a.x,y0:a.y,x1:b.x,y1:b.y,p:0});
+        }
+      }
+    }
+    /* 重心 */
+    let cx=0, cy=0;
+    poly.forEach(p=>{cx+=p.x; cy+=p.y;});
+    cx/=poly.length; cy/=poly.length;
+    /* 初速: 打点から放射 + 上へ弾ける */
+    const dx=cx-ix, dy=cy-iy;
+    const d = Math.hypot(dx,dy)+8;
+    const pow = (reduceMotion?0.4:1) * (260 + 2600/d);
+    shards.push({
+      verts: poly.map(p=>({x:p.x,y:p.y})),
+      cen: {x:cx,y:cy},
+      x:cx, y:cy, a:0,
+      vx: dx/d*pow + (Math.random()-.5)*60,
+      vy: dy/d*pow*0.7 - (90+Math.random()*160),
+      va: (Math.random()-.5)*7,
+      asleep:false,
+      stag: Math.random()*0.45,
+    });
+  }
+  state = 'shattered';
+  goldCtx.clearRect(0,0,goldCan.width,goldCan.height);
+  setMendEnabled(true);
+  document.getElementById('hint').classList.add('gone');
+  document.getElementById('kotoba').classList.remove('show');
+}
+function clipHalfPlane(poly, si, sj, jTag){
+  /* siに近い側を残す。新しくできた交点に src=jTag を付与 */
+  const f = p => (p.x-si.x)**2+(p.y-si.y)**2 - ((p.x-sj.x)**2+(p.y-sj.y)**2);
+  const out = [];
+  for (let k=0;k<poly.length;k++){
+    const a = poly[k], b = poly[(k+1)%poly.length];
+    const fa = f(a), fb = f(b);
+    if (fa <= 0) out.push(a);
+    if ((fa<0) !== (fb<0)){
+      const t = fa/(fa-fb);
+      out.push({x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t, src:jTag});
+    }
+  }
+  return out;
+}
+function gauss(){ return (Math.random()+Math.random()+Math.random()-1.5)/1.5*2; }
+
+/* ---------- 剛体物理 ---------- */
+const GRV = 2300, REST = 0.32;
+function physics(dt){
+  let allAsleep = true;
+  for (const s of shards){
+    if (s.asleep) continue;
+    allAsleep = false;
+    s.vy += GRV*dt;
+    s.x += s.vx*dt; s.y += s.vy*dt; s.a += s.va*dt;
+    /* 最下点を求めて床と衝突 */
+    let low = -1e9, lowX = 0;
+    const ca = Math.cos(s.a), sa = Math.sin(s.a);
+    for (const v of s.verts){
+      const rx = v.x - s.cen.x, ry = v.y - s.cen.y;
+      const wy = s.y + rx*sa + ry*ca;
+      if (wy > low){ low = wy; lowX = s.x + rx*ca - ry*sa; }
+    }
+    if (low > FLOOR){
+      s.y -= (low - FLOOR);
+      if (s.vy > 30){
+        s.vy = -s.vy*REST;
+        s.va += (lowX - s.x)*-0.05 + (Math.random()-.5)*1.2;
+        s.vx *= 0.8;
+      } else {
+        s.vy = 0; s.vx *= 0.86; s.va *= 0.8;
+        if (Math.abs(s.vx)<6 && Math.abs(s.va)<0.25){ s.vx=0; s.va=0; s.asleep=true; }
+      }
+    }
+    /* 壁 */
+    if (s.x < R*0.2){ s.x = R*0.2; s.vx = Math.abs(s.vx)*0.5; }
+    if (s.x > W-R*0.2){ s.x = W-R*0.2; s.vx = -Math.abs(s.vx)*0.5; }
+  }
+  return allAsleep;
+}
+
+/* ---------- 継ぐ ---------- */
+function startMend(){
+  if (state !== 'shattered') return;
+  state = 'mending'; mendT = 0;
+  setMendEnabled(false);
+  for (const s of shards){
+    s.sx=s.x; s.sy=s.y; s.sa=s.a;
+    /* 角度は最短経路で戻す */
+    s.sa = ((s.sa % (Math.PI*2)) + Math.PI*3) % (Math.PI*2) - Math.PI;
+  }
+}
+const ease = t => t<.5 ? 4*t*t*t : 1-Math.pow(-2*t+2,3)/2;
+function mendStep(dt){
+  mendT += dt;
+  const DUR = reduceMotion ? 0.01 : 1.5;
+  let done = true;
+  for (const s of shards){
+    const t = Math.min(Math.max((mendT - s.stag)/DUR, 0), 1);
+    if (t < 1) done = false;
+    const e = ease(t);
+    s.x = s.sx + (s.cen.x - s.sx)*e;
+    s.y = s.sy + (s.cen.y - s.sy)*e;
+    s.a = s.sa * (1-e);
+  }
+  if (done){
+    state = 'gilding'; mendT = 0;
+    goldCtx.clearRect(0,0,goldCan.width,goldCan.height);
+    for (const m of seams){ m.p = 0; m.stag = Math.random()*1.2; m.w = 2.2+Math.random()*1.8; }
+  }
+}
+/* 金が流れる */
+function gildStep(dt){
+  mendT += dt;
+  let done = true;
+  const sc = goldCan.width / (R*2);   // 画面→テクスチャ座標
+  for (const m of seams){
+    const t = Math.min(Math.max((mendT - m.stag)/(reduceMotion?0.01:0.9), 0), 1);
+    if (t < 1) done = false;
+    if (t <= m.p) continue;
+    const x0 = (m.x0-(CX-R))*sc, y0 = (m.y0-(CY-R))*sc;
+    const x1 = (m.x1-(CX-R))*sc, y1 = (m.y1-(CY-R))*sc;
+    const g = goldCtx;
+    g.strokeStyle = '#C9A227';
+    g.lineWidth = m.w*sc/DPR*0.9;
+    g.lineCap = 'round';
+    g.shadowColor = 'rgba(242,210,122,0.9)';
+    g.shadowBlur = 6;
+    g.beginPath();
+    g.moveTo(x0+(x1-x0)*m.p, y0+(y1-y0)*m.p);
+    g.lineTo(x0+(x1-x0)*t,   y0+(y1-y0)*t);
+    g.stroke();
+    /* 芯の照り */
+    g.shadowBlur = 0;
+    g.strokeStyle = '#F2D27A';
+    g.lineWidth = m.w*sc/DPR*0.4;
+    g.beginPath();
+    g.moveTo(x0+(x1-x0)*m.p, y0+(y1-y0)*m.p);
+    g.lineTo(x0+(x1-x0)*t,   y0+(y1-y0)*t);
+    g.stroke();
+    m.p = t;
+  }
+  if (done){
+    /* 金を器に焼き込み、次の破砕へ */
+    texCtx.drawImage(goldCan, 0, 0);
+    shards = []; seams = [];
+    state = 'intact';
+    breaks++;
+    document.getElementById('kotoba').classList.add('show');
+  }
+}
+
+/* ---------- 描画 ---------- */
+function drawShard(s){
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(s.a);
+  ctx.translate(-s.cen.x, -s.cen.y);
+  ctx.beginPath();
+  s.verts.forEach((v,i)=> i? ctx.lineTo(v.x,v.y) : ctx.moveTo(v.x,v.y));
+  ctx.closePath();
+  ctx.save();
+  ctx.clip();
+  ctx.drawImage(tex, CX-R, CY-R, R*2, R*2);
+  ctx.restore();
+  /* 割れ口(素地の色) */
+  ctx.strokeStyle = 'rgba(140,120,95,0.55)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+}
+function shadow(x,y,w,al){
+  const g = ctx.createRadialGradient(x,y,0,x,y,w);
+  g.addColorStop(0,`rgba(60,52,40,${al})`);
+  g.addColorStop(1,'rgba(60,52,40,0)');
+  ctx.fillStyle = g;
+  ctx.save(); ctx.translate(x,y); ctx.scale(1,0.32); ctx.translate(-x,-y);
+  ctx.beginPath(); ctx.arc(x,y,w,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+let last = performance.now();
+function frame(now){
+  const dt = Math.min((now-last)/1000, 0.033);
+  last = now;
+
+  if (state === 'shattered') physics(dt);
+  else if (state === 'mending') mendStep(dt);
+  else if (state === 'gilding') gildStep(dt);
+
+  ctx.clearRect(0,0,W,H);
+
+  if (state === 'intact'){
+    shadow(CX, CY+R*1.06, R*1.05, 0.22);
+    ctx.drawImage(tex, CX-R, CY-R, R*2, R*2);
+  } else {
+    /* 破片の影 */
+    for (const s of shards) shadow(s.x, FLOOR+6, R*0.32, Math.max(0, 0.16 - (FLOOR-s.y)/H*0.18));
+    for (const s of shards) drawShard(s);
+    if (state === 'gilding'){
+      ctx.drawImage(goldCan, CX-R, CY-R, R*2, R*2);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- 入力 ---------- */
+addEventListener('pointerdown', e=>{
+  if (e.target.closest('#ui')) return;
+  if (state !== 'intact') return;
+  const d = Math.hypot(e.clientX-CX, e.clientY-CY);
+  if (d < R) shatter(e.clientX, e.clientY);
+});
+
+/* ---------- UI ---------- */
+function setMendEnabled(on){ document.getElementById('mend').disabled = !on; }
+document.getElementById('mend').addEventListener('click', startMend);
+document.getElementById('renew').addEventListener('click', ()=>{
+  makePlate(); shards=[]; seams=[]; state='intact'; breaks=0;
+  setMendEnabled(false);
+  document.getElementById('kotoba').classList.remove('show');
+  document.getElementById('hint').classList.remove('gone');
+});
+document.querySelectorAll('.glz').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('.glz').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    glaze = b.dataset.g;
+    makePlate(); shards=[]; seams=[]; state='intact'; breaks=0;
+    setMendEnabled(false);
+    document.getElementById('kotoba').classList.remove('show');
+  });
+});
+
+resize();
+addEventListener('resize', resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>枯山水 — Karesansui</title>
+<style>
+  :root{
+    --sand:    #E8E0CD;
+    --sumi:    #1C1A17;
+    --sumi-soft:#4A453E;
+    --shu:     #B43B2E;
+    --serif: "Hiragino Mincho ProN","Yu Mincho","Noto Serif JP",serif;
+    --mono: "SF Mono",Menlo,Consolas,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden}
+  body{
+    background:var(--sand);
+    font-family:var(--serif);
+    color:var(--sumi);
+    -webkit-user-select:none;user-select:none;
+    touch-action:none;
+  }
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #sandc{z-index:1}
+  #overlay{z-index:2}
+
+  #title{
+    position:fixed;top:28px;left:26px;z-index:5;
+    writing-mode:vertical-rl;pointer-events:none;
+  }
+  #title h1{font-size:clamp(22px,3.2vmin,34px);font-weight:500;letter-spacing:.55em}
+  #title .en{
+    margin-top:6px;margin-right:2px;
+    font-family:var(--mono);font-size:9px;letter-spacing:.3em;color:var(--sumi-soft);
+    writing-mode:vertical-rl;
+  }
+
+  #hint{
+    position:fixed;left:50%;top:46%;transform:translate(-50%,-50%);
+    z-index:5;pointer-events:none;
+    font-size:clamp(13px,2vmin,17px);
+    letter-spacing:.8em;text-indent:.8em;
+    color:var(--sumi-soft);
+    opacity:1;transition:opacity 1.2s ease;
+    text-align:center;
+  }
+  #hint.gone{opacity:0}
+
+  #ui{
+    position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
+    z-index:5;display:flex;align-items:center;gap:clamp(14px,2.6vw,30px);
+    padding:10px 22px;
+    background:rgba(232,224,205,.72);
+    backdrop-filter:blur(6px);
+    border:1px solid rgba(28,26,23,.12);
+    border-radius:99px;
+  }
+  .btn{
+    font-family:var(--serif);
+    font-size:clamp(12px,1.6vmin,14px);
+    letter-spacing:.25em;text-indent:.25em;
+    color:var(--sumi);background:none;border:none;cursor:pointer;
+    padding:6px 4px;border-bottom:1px solid transparent;
+    transition:border-color .25s ease,color .25s;
+  }
+  .btn:hover{border-bottom-color:var(--sumi)}
+  .btn.active{border-bottom-color:var(--shu);color:var(--shu)}
+  .btn:focus-visible{outline:1.5px solid var(--shu);outline-offset:3px;border-radius:4px}
+  .sep{width:1px;height:18px;background:rgba(28,26,23,.18)}
+
+  @media (max-width:640px){
+    #title{top:18px;left:14px}
+    #ui{gap:10px;padding:8px 14px;bottom:14px;max-width:94vw;flex-wrap:wrap;justify-content:center;border-radius:24px}
+  }
+</style>
+</head>
+<body>
+<canvas id="sandc"></canvas>
+<canvas id="overlay"></canvas>
+
+<div id="title">
+  <h1>枯山水</h1>
+  <div class="en">KARESANSUI — RAKED SAND PHYSICS</div>
+</div>
+
+<div id="hint">砂 を 、撫 で る</div>
+
+<div id="ui">
+  <button class="btn active" id="m-rake">熊手</button>
+  <button class="btn" id="m-stone">石を置く</button>
+  <div class="sep"></div>
+  <button class="btn" id="auto">自動作庭</button>
+  <div class="sep"></div>
+  <button class="btn" id="flat">砂を均す</button>
+</div>
+
+<script>
+'use strict';
+/* ============================================================
+   枯山水 — 砂のハイトフィールド物理
+   ・熊手: 溝を掘り、押し退けた砂を畝として両脇に盛る
+   ・安息角: 傾きが限界を超えた砂は崩れて流れる(毎フレーム緩和)
+   ・石: 置くと砂紋が自動でその周りを巡る
+============================================================ */
+
+const sandc   = document.getElementById('sandc');
+const overlay = document.getElementById('overlay');
+const sctx = sandc.getContext('2d');
+const octx = overlay.getContext('2d');
+const DPR = Math.min(devicePixelRatio || 1, 2);
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+let W=0, H=0;
+let gw=0, gh=0, cell=4;            // 砂グリッド
+let h, grain, stoneMask;           // 高さ / 砂粒ノイズ / 石マスク
+let gcan, gctx, img;               // グリッド描画用オフスクリーン
+let stones = [];                   // {x,y,r,verts,seed} (グリッド座標)
+let mode = 'rake';
+let tasks = [];                    // 自動作庭などのアニメーションタスク
+
+/* ---- 差分更新(高解像度でも軽く保つ) ---- */
+let dirty=false, dX0=0, dY0=0, dX1=0, dY1=0, settle=0, needAll=true;
+function markDirty(x,y,r=2){
+  const x0=Math.max(0,Math.floor(x-r)), y0=Math.max(0,Math.floor(y-r));
+  const x1=Math.min(gw-1,Math.ceil(x+r)), y1=Math.min(gh-1,Math.ceil(y+r));
+  if(!dirty){ dX0=x0; dY0=y0; dX1=x1; dY1=y1; dirty=true; }
+  else{
+    dX0=Math.min(dX0,x0); dY0=Math.min(dY0,y0);
+    dX1=Math.max(dX1,x1); dY1=Math.max(dY1,y1);
+  }
+  settle=0;
+}
+
+/* ---- パラメータ ---- */
+const REPOSE = 0.55;     // 安息角(セルあたり許容高低差)
+const FLOW   = 0.18;     // 崩れの速さ
+const GROOVE = 3.1;      // 熊手の溝の深さ
+const TEETH  = 5;        // 熊手の歯の数
+const TOOTH_GAP = 3.2;   // 歯の間隔(セル)
+
+/* ---------- 初期化 ---------- */
+function resize(){
+  W = innerWidth; H = innerHeight;
+  sandc.width = W*DPR; sandc.height = H*DPR;
+  overlay.width = W*DPR; overlay.height = H*DPR;
+  sctx.setTransform(DPR,0,0,DPR,0,0);
+  octx.setTransform(DPR,0,0,DPR,0,0);
+
+  cell = Math.max(2, Math.round(Math.min(W,H)/600));
+  gw = Math.ceil(W/cell); gh = Math.ceil(H/cell);
+  h = new Float32Array(gw*gh);
+  grain = new Float32Array(gw*gh);
+  stoneMask = new Uint8Array(gw*gh);
+  for (let i=0;i<grain.length;i++) grain[i] = Math.random()*2-1;
+
+  gcan = document.createElement('canvas');
+  gcan.width = gw; gcan.height = gh;
+  gctx = gcan.getContext('2d');
+  img = gctx.createImageData(gw, gh);
+
+  stones = [];
+  tasks = [];
+  dirty = false; needAll = true;
+}
+const idx = (x,y) => y*gw + x;
+const inb = (x,y) => x>=0 && y>=0 && x<gw && y<gh;
+
+/* ---------- 安息角による崩れ(緩和: 変化した領域のみ) ---------- */
+function relax(iter){
+  if (!dirty) return;
+  let moved = 0;
+  const y0=Math.max(1,dY0), y1=Math.min(gh-2,dY1);
+  const x0=Math.max(1,dX0), x1=Math.min(gw-2,dX1);
+  for (let k=0;k<iter;k++){
+    /* 市松順で偏りを減らす */
+    const off = k & 1;
+    for (let y=y0;y<=y1;y++){
+      for (let x=x0+((y+off)&1);x<=x1;x+=2){
+        const i = idx(x,y);
+        if (stoneMask[i]) continue;
+        moved += flow(i, idx(x+1,y));
+        moved += flow(i, idx(x-1,y));
+        moved += flow(i, idx(x,y+1));
+        moved += flow(i, idx(x,y-1));
+      }
+    }
+  }
+  /* 崩れが外へ広がる余地を1セルずつ確保 */
+  dX0=Math.max(0,dX0-1); dY0=Math.max(0,dY0-1);
+  dX1=Math.min(gw-1,dX1+1); dY1=Math.min(gh-1,dY1+1);
+  /* 動きが収まったら計算を止める */
+  if (moved < 0.02){ if (++settle > 10) dirty = false; }
+  else settle = 0;
+}
+function flow(i, j){
+  if (stoneMask[j]) return 0;
+  const d = h[i] - h[j];
+  if (d > REPOSE){
+    const m = (d - REPOSE) * FLOW;
+    h[i] -= m; h[j] += m;
+    return m;
+  }
+  return 0;
+}
+
+/* ---------- 熊手 ---------- */
+/* 1本の歯: 溝を掘り、進行方向と直交する両脇に砂を盛る */
+function carve(gx, gy, sx, sy, depth){
+  const x = Math.round(gx), y = Math.round(gy);
+  if (!inb(x,y) || stoneMask[idx(x,y)]) return;
+  const i = idx(x,y);
+  h[i] -= depth;
+  markDirty(gx, gy, 3);
+  /* 押し退けた砂は両脇へ(質量保存ぎみ) */
+  const lx = Math.round(gx+sx), ly = Math.round(gy+sy);
+  const rx = Math.round(gx-sx), ry = Math.round(gy-sy);
+  if (inb(lx,ly) && !stoneMask[idx(lx,ly)]) h[idx(lx,ly)] += depth*0.42;
+  if (inb(rx,ry) && !stoneMask[idx(rx,ry)]) h[idx(rx,ry)] += depth*0.42;
+}
+/* 線分に沿って熊手を引く(teeth本) */
+function rakeSegment(x0,y0,x1,y1, teeth=TEETH, depth=GROOVE){
+  const dx = x1-x0, dy = y1-y0;
+  const len = Math.hypot(dx,dy);
+  if (len < 0.01) return;
+  const ux = dx/len, uy = dy/len;      // 進行方向
+  const px = -uy,    py = ux;          // 直交 = 熊手の柄方向
+  const steps = Math.max(1, Math.ceil(len));
+  const mid = (teeth-1)/2;
+  for (let s=0;s<=steps;s++){
+    const cx = x0 + ux*len*s/steps;
+    const cy = y0 + uy*len*s/steps;
+    for (let t=0;t<teeth;t++){
+      const o = (t-mid)*TOOTH_GAP;
+      carve(cx+px*o, cy+py*o, px, py, depth);
+    }
+  }
+}
+
+/* ---------- 石 ---------- */
+function makeStone(gx, gy){
+  const r = (Math.min(gw,gh)*0.045) * (0.8+Math.random()*0.7);
+  const n = 9 + Math.floor(Math.random()*4);
+  const verts = [];
+  for (let i=0;i<n;i++){
+    const a = i/n*Math.PI*2;
+    verts.push({a, r: r*(0.78+Math.random()*0.4)});
+  }
+  const st = {x:gx, y:gy, r, verts, seed:Math.random()};
+  stones.push(st);
+  /* マスク登録 + 根元に砂を寄せる */
+  const R = Math.ceil(r+1);
+  for (let y=-R;y<=R;y++)for(let x=-R;x<=R;x++){
+    const X=Math.round(gx+x), Y=Math.round(gy+y);
+    if(!inb(X,Y)) continue;
+    const d = Math.hypot(x,y);
+    if (d < r*0.92) stoneMask[idx(X,Y)] = 1;
+    else if (d < r*1.6) h[idx(X,Y)] += (1 - (d-r*0.92)/(r*0.68)) * 1.2; // 根元の盛り
+  }
+  markDirty(gx, gy, r*1.8);
+  /* 砂紋を巡らせるタスク(同心円を1本ずつ描く) */
+  const rings = 3;
+  for (let k=1;k<=rings;k++){
+    tasks.push({type:'ring', cx:gx, cy:gy, r:r + k*TOOTH_GAP*1.7, a:Math.random()*Math.PI*2, done:0, speed: reduceMotion? 1 : 0.10});
+  }
+  return st;
+}
+function removeStoneAt(gx,gy){
+  for (let i=stones.length-1;i>=0;i--){
+    const s = stones[i];
+    if (Math.hypot(gx-s.x, gy-s.y) < s.r*1.1){
+      stones.splice(i,1);
+      rebuildMask();
+      return true;
+    }
+  }
+  return false;
+}
+function rebuildMask(){
+  stoneMask.fill(0);
+  for (const s of stones){
+    const R = Math.ceil(s.r+1);
+    for (let y=-R;y<=R;y++)for(let x=-R;x<=R;x++){
+      const X=Math.round(s.x+x), Y=Math.round(s.y+y);
+      if(inb(X,Y) && Math.hypot(x,y) < s.r*0.92) stoneMask[idx(X,Y)] = 1;
+    }
+  }
+}
+
+/* ---------- 自動作庭 ---------- */
+function autoGarden(){
+  tasks = [];
+  stones = []; stoneMask.fill(0);
+  h.fill(0);
+  dirty = false; needAll = true;
+  /* 横一面の砂紋(上から順に) */
+  const rows = Math.floor(gh / (TEETH*TOOTH_GAP*1.05));
+  for (let r=0;r<rows;r++){
+    const y = (r+0.5) * gh/rows;
+    tasks.push({type:'line', x0:-4, y0:y, x1:gw+4, y1:y, p:0, speed: reduceMotion? 1 : 0.05});
+  }
+  /* 三分割の位置に石を据える */
+  tasks.push({type:'stone', x:gw*0.33, y:gh*0.40});
+  tasks.push({type:'stone', x:gw*0.68, y:gh*0.62});
+  if (Math.random()<0.6) tasks.push({type:'stone', x:gw*0.55, y:gh*0.30});
+  document.getElementById('hint').classList.add('gone');
+}
+function runTasks(){
+  if (!tasks.length) return;
+  const t = tasks[0];
+  if (t.type === 'line'){
+    const np = Math.min(1, t.p + t.speed);
+    rakeSegment(
+      t.x0+(t.x1-t.x0)*t.p, t.y0+(t.y1-t.y0)*t.p,
+      t.x0+(t.x1-t.x0)*np,  t.y0+(t.y1-t.y0)*np
+    );
+    t.p = np;
+    if (t.p >= 1) tasks.shift();
+  } else if (t.type === 'ring'){
+    const step = Math.PI*2 * t.speed;
+    const n = Math.max(2, Math.ceil(t.r*step));
+    let a0 = t.a + t.done;
+    for (let i=1;i<=n;i++){
+      const a1 = a0 + step/n;
+      rakeSegment(
+        t.cx + Math.cos(a0)*t.r, t.cy + Math.sin(a0)*t.r,
+        t.cx + Math.cos(a1)*t.r, t.cy + Math.sin(a1)*t.r,
+        1, GROOVE*0.85
+      );
+      a0 = a1;
+    }
+    t.done += step;
+    if (t.done >= Math.PI*2) tasks.shift();
+  } else if (t.type === 'stone'){
+    makeStone(t.x, t.y);
+    tasks.shift();
+  }
+}
+
+/* ---------- 砂の描画(法線ライティング / 変化領域のみ再計算) ---------- */
+/* 光: 左上やや手前から */
+const LX=-0.55, LY=-0.62, LZ=0.56;
+function renderSand(){
+  if (needAll){
+    renderRegion(0, 0, gw-1, gh-1);
+    needAll = false;
+  } else if (dirty){
+    renderRegion(
+      Math.max(0,dX0-1), Math.max(0,dY0-1),
+      Math.min(gw-1,dX1+1), Math.min(gh-1,dY1+1)
+    );
+  }
+  sctx.imageSmoothingEnabled = true;
+  sctx.drawImage(gcan, 0,0, W, H);
+}
+function renderRegion(x0,y0,x1,y1){
+  const d = img.data;
+  for (let y=y0;y<=y1;y++){
+    for (let x=x0;x<=x1;x++){
+      const i = idx(x,y);
+      /* 勾配から法線 */
+      const xl = h[idx(Math.max(x-1,0),y)], xr = h[idx(Math.min(x+1,gw-1),y)];
+      const yu = h[idx(x,Math.max(y-1,0))], yd = h[idx(x,Math.min(y+1,gh-1))];
+      let nx = (xl-xr)*0.9, ny = (yu-yd)*0.9, nz = 1.6;
+      const nl = Math.hypot(nx,ny,nz);
+      const diff = Math.max(0,(nx*LX+ny*LY+nz*LZ)/nl);
+      let v = 0.62 + diff*0.55;
+      v += grain[i]*0.022;                     // 砂粒
+      v += Math.min(Math.max(h[i],-3),3)*0.012; // 高い所はわずかに明るく
+      const R = 236*v, G2 = 227*v, B = 205*v;
+      const o = i*4;
+      d[o]=R; d[o+1]=G2; d[o+2]=B; d[o+3]=255;
+    }
+  }
+  gctx.putImageData(img, 0, 0, x0, y0, x1-x0+1, y1-y0+1);
+}
+
+/* ---------- 石の描画 ---------- */
+function drawStones(){
+  for (const s of stones){
+    const cx = s.x*cell, cy = s.y*cell, rr = s.r*cell;
+    /* 落ち影 */
+    octx.save();
+    octx.translate(cx+rr*0.22, cy+rr*0.26);
+    octx.scale(1.15,0.85);
+    const sh = octx.createRadialGradient(0,0,rr*0.2, 0,0,rr*1.25);
+    sh.addColorStop(0,'rgba(60,52,40,0.30)');
+    sh.addColorStop(1,'rgba(60,52,40,0)');
+    octx.fillStyle = sh;
+    octx.beginPath(); octx.arc(0,0,rr*1.25,0,Math.PI*2); octx.fill();
+    octx.restore();
+    /* 岩体 */
+    octx.save();
+    octx.translate(cx,cy);
+    octx.beginPath();
+    s.verts.forEach((v,i)=>{
+      const px = Math.cos(v.a)*v.r*cell, py = Math.sin(v.a)*v.r*cell*0.92;
+      i? octx.lineTo(px,py) : octx.moveTo(px,py);
+    });
+    octx.closePath();
+    const g = octx.createLinearGradient(-rr,-rr,rr,rr);
+    g.addColorStop(0,'#6E6A60');
+    g.addColorStop(0.55,'#4C483F');
+    g.addColorStop(1,'#332F29');
+    octx.fillStyle = g;
+    octx.fill();
+    /* 上面のハイライトと苔 */
+    octx.clip();
+    octx.fillStyle = 'rgba(232,224,205,0.14)';
+    octx.beginPath(); octx.ellipse(-rr*0.25,-rr*0.35, rr*0.7, rr*0.4, -0.4, 0, Math.PI*2); octx.fill();
+    octx.fillStyle = 'rgba(96,112,72,0.30)';
+    octx.beginPath(); octx.ellipse(rr*0.1*(s.seed-0.5), -rr*0.55, rr*0.45, rr*0.16, 0.2, 0, Math.PI*2); octx.fill();
+    octx.restore();
+  }
+}
+
+/* ---------- 入力 ---------- */
+let dragging = false, prev = null;
+const toGrid = e => ({x: e.clientX/cell, y: e.clientY/cell});
+
+addEventListener('pointerdown', e=>{
+  if (e.target.closest('#ui')) return;
+  document.getElementById('hint').classList.add('gone');
+  const g = toGrid(e);
+  if (mode === 'stone'){
+    if (!removeStoneAt(g.x,g.y)) makeStone(g.x, g.y);
+    return;
+  }
+  dragging = true; prev = g;
+});
+addEventListener('pointermove', e=>{
+  if (!dragging) return;
+  const g = toGrid(e);
+  rakeSegment(prev.x, prev.y, g.x, g.y);
+  prev = g;
+  /* 熊手ガイド表示用 */
+  rakeGuide = {x:e.clientX, y:e.clientY, dx:g.x-prev.x, dy:g.y-prev.y};
+});
+addEventListener('pointerup', ()=>{ dragging=false; prev=null; });
+
+let rakeGuide = null;
+addEventListener('pointermove', e=>{
+  if (mode==='rake') rakeGuide = {x:e.clientX, y:e.clientY};
+  else rakeGuide = null;
+});
+
+/* ---------- UI ---------- */
+const bRake = document.getElementById('m-rake');
+const bStone = document.getElementById('m-stone');
+function setMode(m){
+  mode = m;
+  bRake.classList.toggle('active', m==='rake');
+  bStone.classList.toggle('active', m==='stone');
+  document.getElementById('hint').textContent = m==='rake' ? '砂 を 、撫 で る' : '据 え る 場 所 を 、選 ぶ';
+  if (m==='stone') document.getElementById('hint').classList.remove('gone');
+}
+bRake.addEventListener('click', ()=>setMode('rake'));
+bStone.addEventListener('click', ()=>setMode('stone'));
+document.getElementById('auto').addEventListener('click', autoGarden);
+document.getElementById('flat').addEventListener('click', ()=>{
+  /* 砂だけ均す(石は残す) */
+  tasks = [];
+  for (let i=0;i<h.length;i++) if(!stoneMask[i]) h[i] *= 0.0;
+  dirty = false; needAll = true;
+});
+
+/* ---------- メインループ ---------- */
+function frame(){
+  runTasks();
+  relax(2);
+  renderSand();
+  octx.clearRect(0,0,W,H);
+  drawStones();
+  /* 熊手のガイド(歯の位置) */
+  if (rakeGuide && mode==='rake'){
+    octx.strokeStyle = 'rgba(28,26,23,0.35)';
+    octx.lineWidth = 1;
+    const span = ((TEETH-1)/2)*TOOTH_GAP*cell;
+    octx.beginPath();
+    octx.moveTo(rakeGuide.x-span, rakeGuide.y);
+    octx.lineTo(rakeGuide.x+span, rakeGuide.y);
+    octx.stroke();
+    for (let t=0;t<TEETH;t++){
+      const o = (t-(TEETH-1)/2)*TOOTH_GAP*cell;
+      octx.beginPath();
+      octx.arc(rakeGuide.x+o, rakeGuide.y, 1.6, 0, Math.PI*2);
+      octx.fillStyle='rgba(28,26,23,0.45)';
+      octx.fill();
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+resize();
+addEventListener('resize', resize);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
