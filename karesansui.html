@@ -70,8 +70,27 @@
   .btn:focus-visible{outline:1.5px solid var(--shu);outline-offset:3px;border-radius:4px}
   .sep{width:1px;height:18px;background:rgba(28,26,23,.18)}
 
+  #nav{
+    position:fixed;top:22px;right:22px;z-index:6;
+    display:flex;align-items:center;gap:clamp(10px,2vw,18px);
+    padding:8px 16px;
+    background:rgba(232,224,205,.72);backdrop-filter:blur(6px);
+    border:1px solid rgba(28,26,23,.12);border-radius:99px;
+  }
+  .nav-link{
+    font-family:var(--serif);font-size:clamp(11px,1.4vmin,13px);
+    letter-spacing:.2em;text-indent:.2em;color:var(--sumi-soft);
+    text-decoration:none;padding:4px 2px;border-bottom:1px solid transparent;
+    transition:border-color .25s,color .25s;
+  }
+  .nav-link:hover{color:var(--sumi);border-bottom-color:var(--sumi)}
+  .nav-link.active{color:var(--shu);border-bottom-color:var(--shu);pointer-events:none}
+  .nav-sep{width:1px;height:14px;background:rgba(28,26,23,.18)}
+
   @media (max-width:640px){
     #title{top:18px;left:14px}
+    #nav{top:14px;right:10px;gap:8px;padding:6px 12px}
+    .nav-link{font-size:10px;letter-spacing:.1em;text-indent:.1em}
     #ui{gap:10px;padding:8px 14px;bottom:14px;max-width:94vw;flex-wrap:wrap;justify-content:center;border-radius:24px}
   }
 </style>
@@ -79,6 +98,14 @@
 <body>
 <canvas id="sandc"></canvas>
 <canvas id="overlay"></canvas>
+
+<nav id="nav" aria-label="ページメニュー">
+  <a href="index.html" class="nav-link">墨流し</a>
+  <span class="nav-sep"></span>
+  <a href="kintsugi.html" class="nav-link">金継ぎ</a>
+  <span class="nav-sep"></span>
+  <a href="karesansui.html" class="nav-link active">枯山水</a>
+</nav>
 
 <div id="title">
   <h1>枯山水</h1>
